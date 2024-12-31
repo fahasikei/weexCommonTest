@@ -127,6 +127,9 @@ function clearData() {
   eventOrAttrsMap = []
   classNameId = 1
   elementMap = []
+  watchArray = []
+  watchClassName = []
+  chunkNum = 0
 }
 
 /**
@@ -319,6 +322,9 @@ function resolveTemplate(template) {
   // 解析 v-grouping-child-elements 属性
   parseGroupingChildElements(templateAst)
 
+  // 解析 v-dynamic-monitoring 属性
+  parseGroupingWatchElements(templateAst)
+
   // 只有当模块中存在绑定指定的事件和属性时，才会做组件名还原和将templateAst转为代码字符串
   if (elementMap.length !== 0 || needTranslate) {
     // 遍历节点，将himalaya改动的组件名还原
@@ -419,6 +425,10 @@ let classNameId = 1
  * isIdentifer?: 是否是变量属性值，即:paging-enabled这种格式，该字段只有解析属性值时存在，如果是事件则不存在
  */
 let eventOrAttrsMap = []
+
+let chunkNum = 0
+let watchArray = []
+let watchClassName = []
 
 
 /**
@@ -915,6 +925,102 @@ function parseMethods(path) {
   }
 }
 
+function parseWatch(path, watchArray) {
+  const node = path.node
+  let handleNodes = []
+  watchClassName.forEach((name) => {
+    elementMap.forEach((item) => {
+      if (item.className === name) {
+        const objectNodes = item.eventOrAttrsMap.map((eventOrAttrs) => {
+          // 处理回调函数参数
+          const paramsElements = eventOrAttrs.params?.map((param) => {
+            return t.stringLiteral(param)
+          })
+
+          // 处理事件绑定的修饰符，例如.stop .prevent等
+          const modifiers = eventOrAttrs.modifier?.map((modifier) => {
+            return t.stringLiteral(modifier)
+          })
+
+          // 返回对象表达式 { name: '@touchstart', handler: callback, params: ['item', 'index'], modifier: ['stop'] }
+          return t.objectExpression([
+            t.objectProperty(
+              t.identifier('name'),
+              t.stringLiteral(eventOrAttrs.name)
+            ),
+            t.objectProperty(
+              t.identifier('handler'),
+              parseHandler(eventOrAttrs)
+            ),
+            t.objectProperty(
+              t.identifier('params'),
+              t.arrayExpression(paramsElements)
+            ),
+            t.objectProperty(
+              t.identifier('isEvent'),
+              t.booleanLiteral(eventOrAttrs.isEvent)
+            ),
+            t.objectProperty(
+              t.identifier('modifier'),
+              t.arrayExpression(modifiers)
+            ),
+          ])
+        })
+
+        // 生成weex_harmongy_registerGesture()表达式节点
+        handleNodes.push(t.expressionStatement(
+          t.callExpression(t.identifier('weex_harmongy_registerGesture'), [
+            t.arrayExpression(objectNodes),
+            t.stringLiteral(item.className)
+          ])
+        ))
+
+        watchArray.forEach((data) => {
+          if (t.isObjectExpression(node.declaration)) {
+            const properties = node.declaration.properties
+            const result = properties.find(item => item.key.name == 'watch')
+            const watchMethod = t.objectMethod(
+              'method',  // 方法类型：'method'
+              t.identifier(data), // 方法名称：'{data}'
+              [
+                t.identifier('newValue'),
+                t.identifier('oldValue')
+              ],
+              t.blockStatement([
+                t.expressionStatement(
+                  t.callExpression(
+                    t.memberExpression(
+                      t.thisExpression(),
+                      t.identifier('$nextTick')
+                    ),
+                    [
+                      t.arrowFunctionExpression(
+                        [],
+                        t.blockStatement(handleNodes)
+                      )
+                    ]
+                  )
+                )
+              ])
+            )
+            if (result) {
+              result.value.properties.push(watchMethod)
+            } else {
+              const watchNode = t.objectProperty(
+                t.identifier('watch'),
+                t.objectExpression([
+                  watchMethod
+                ])
+              )
+              properties.push(watchNode)
+            }
+          }
+        })
+      }
+    })
+  })
+}
+
 /**
  * 对vue默认导出做增删改操作
  */
@@ -924,8 +1030,13 @@ function parseDefaultDeclarationNode(path) {
     parseMounted(path)
     // 添加data数据
     addDataNode(path)
-    //解析methods属性
+    // 解析methods属性
     parseMethods(path)
+
+    // 检测到v-dynamic-monitoring属性时对watch属性做处理
+    if (watchArray.length !== 0) {
+      parseWatch(path, watchArray)
+    }
   }
 }
 
@@ -995,7 +1106,6 @@ function checkGroupingChildElements(templateAst) {
   })
 }
 
-let chunkNum
 function commitGroupingChildElements(node) {
   needTranslate = true
   if (node.type === 'element') {
@@ -1087,6 +1197,10 @@ function parseGrouping(node) {
             {
               key: 'v-for',
               value: `(${ITEM_SYMBOL}, ${INDEX_SYMBOL}) in _chunkArray(${right}, ${chunkNum})`,
+            },
+            {
+              key: 'style',
+              value: 'content-visibility: auto'
             }
           ],
           children: [
@@ -1116,6 +1230,41 @@ function checkGrouppingElements(children) {
     }
   } else {
     return false
+  }
+}
+
+/**
+ * 感知v-dynamic-monitoring属性并为元素添加唯一classid
+ */
+function parseGroupingWatchElements(templateAst) {
+  if (!templateAst) return
+  templateAst.forEach((node) => {
+    if (node.type === 'element' && node.attributes?.find((attr) => attr.key === 'v-dynamic-monitoring')) {
+      node.attributes.forEach((attr) => {
+        if (attr && attr.key === 'class') {
+          watchClassName = attr.value.split(' ')
+        }
+      })
+      setClassId(node.attributes)
+      commitDynamicMonitoring(node)
+      needTranslate = true
+    }
+    parseGroupingWatchElements(node.children)
+  })
+}
+
+function commitDynamicMonitoring(node) {
+  needTranslate = true
+  if (node.type === 'element') {
+    const { attributes, children } = node
+    attributes.forEach((attr) => {
+      if (attr.key.includes('v-dynamic-monitoring')) {
+        watchArray = attr.value.slice(1, -1).split(',')
+      }
+    })
+
+    // 去除 v-dynamic-monitoring 属性
+    node.attributes = node.attributes.filter((attr) => attr.key !== 'v-dynamic-monitoring')
   }
 }
 
